@@ -1,5 +1,4 @@
 # # main.py
-
 # from fastapi import FastAPI, File, UploadFile, HTTPException
 # from fastapi.responses import JSONResponse
 # import numpy as np
@@ -78,135 +77,169 @@
 
 
 
-
-
-# main.py
-from fastapi import FastAPI, File, UploadFile, HTTPException
-from fastapi.responses import JSONResponse
+## pdf as input
+import os, io, tempfile, shutil
 import numpy as np
 import cv2
+import fitz  # PyMuPDF
+from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi.responses import JSONResponse
+import docx2txt
 from skimage.metrics import structural_similarity as ssim
 
-app = FastAPI(
-    title="Signature Verification API",
-    description="Compute match accuracy between two signatures using enhanced SSIM pipeline.",
-    version="2.1.0"  # Updated version
-)
+app = FastAPI(version="3.1.0")
 
-# Fixed output size for comparison
+# Fixed size for SSIM comparison
 TARGET_SIZE = (300, 150)
 
-def preprocess_signature(img_bytes: bytes) -> np.ndarray:
-    """
-    Enhanced preprocessing:
-      1) Decode to grayscale
-      2) CLAHE for contrast normalization
-      3) Denoise with bilateral filter
-      4) Find signature region via Otsu threshold
-      5) Crop to signature bounding box
-      6) Resize with aspect ratio preservation
-      7) Pad to target size (centered)
-    Returns grayscale image (0-255) of size TARGET_SIZE.
-    """
-    # 1) Decode
-    arr = np.frombuffer(img_bytes, np.uint8)
-    img = cv2.imdecode(arr, cv2.IMREAD_GRAYSCALE)
-    if img is None:
-        raise ValueError("Invalid image file")
+# -------------------------------------------------------------------
+# 1) Document → Signature Extraction
+# -------------------------------------------------------------------
 
-    # 2) CLAHE (adaptive contrast enhancement)
-    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-    cl = clahe.apply(img)
-
-    # 3) Edge-preserving denoising
-    den = cv2.bilateralFilter(cl, d=11, sigmaColor=100, sigmaSpace=100)
-
-    # 4) Create mask for signature localization
-    _, thresh = cv2.threshold(den, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    coords = cv2.findNonZero(thresh)
-    
-    # 5) Crop to signature region or use full image
-    if coords is not None:
-        x, y, w, h = cv2.boundingRect(coords)
-        cropped = den[y:y+h, x:x+w]
-    else:
-        cropped = den  # Fallback if no contours
-    
-    # 6-7) Preserve aspect ratio while resizing
-    h, w = cropped.shape
-    if h == 0 or w == 0:  # Handle empty images
-        return np.zeros(TARGET_SIZE[::-1], dtype=np.uint8)
-    
-    # Calculate scaling factor
-    scale = min(TARGET_SIZE[0] / w, TARGET_SIZE[1] / h)
-    new_w = int(w * scale)
-    new_h = int(h * scale)
-    
-    # High-quality downscaling
-    resized = cv2.resize(cropped, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
-    
-    # Center-pad to target dimensions
-    canvas = np.full(TARGET_SIZE[::-1], 255, dtype=np.uint8)  # White background
-    x_offset = (TARGET_SIZE[0] - new_w) // 2
-    y_offset = (TARGET_SIZE[1] - new_h) // 2
-    canvas[y_offset:y_offset+new_h, x_offset:x_offset+new_w] = resized
-    
-    return canvas
-
-def compute_signature_match_accuracy(
-    img_bytes1: bytes,
-    img_bytes2: bytes
-) -> float:
+def extract_signature_from_pdf(pdf_bytes: bytes) -> np.ndarray:
     """
-    Computes SSIM on preprocessed grayscale images with:
-    - Dynamic range adjustment
-    - Optimized SSIM parameters
+    Extract embedded images from the last PDF page, threshold each,
+    and pick the one with the highest white-pixel ratio (the signature).
     """
-    img1 = preprocess_signature(img_bytes1)
-    img2 = preprocess_signature(img_bytes2)
-    
-    # Normalize images to 0-1 range for SSIM
-    img1_norm = img1.astype(np.float64) / 255.0
-    img2_norm = img2.astype(np.float64) / 255.0
-    
-    # SSIM with smaller window and higher weights
-    win_size = min(7, min(img1.shape) // 2 * 2 - 1)  # Ensure odd and < image size
-    win_size = max(3, win_size)  # Minimum window size
-    
-    score = ssim(
-        img1_norm, 
-        img2_norm,
-        win_size=win_size,
-        data_range=1.0,
-        gaussian_weights=True,
-        sigma=1.5,
-        use_sample_covariance=False
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    page = doc[-1]  # last page
+    images = page.get_images(full=True)
+    if not images:
+        doc.close()
+        raise ValueError("No images found in PDF")
+
+    best_mask = None
+    best_ratio = 0.0
+
+    for img_meta in images:
+        xref = img_meta[0]
+        pix = fitz.Pixmap(doc, xref)
+        # If CMYK, convert to RGB
+        if pix.n > 4:
+            pix = fitz.Pixmap(pix, 0)
+        arr = np.frombuffer(pix.samples, np.uint8)
+        channels = pix.n
+        arr = arr.reshape((pix.height, pix.width, channels))
+        pix = None
+
+        # Convert to gray if needed
+        if channels >= 3:
+            gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+        else:
+            gray = arr
+
+        # Threshold (invert: strokes→white)
+        _, mask = cv2.threshold(
+            gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
+        )
+
+        # Compute stroke density
+        ratio = cv2.countNonZero(mask) / (mask.size)
+        if ratio > best_ratio:
+            best_ratio = ratio
+            best_mask = mask
+
+    doc.close()
+    if best_mask is None:
+        raise ValueError("Could not extract signature from PDF images")
+
+    return best_mask
+
+
+def extract_signature_from_docx(docx_bytes: bytes) -> np.ndarray:
+    """
+    Extract all images from a DOCX, pick the largest by pixel area,
+    and threshold to obtain a signature mask.
+    """
+    tmp_dir = tempfile.mkdtemp()
+    docx_path = os.path.join(tmp_dir, "input.docx")
+    with open(docx_path, "wb") as f:
+        f.write(docx_bytes)
+
+    img_dir = os.path.join(tmp_dir, "imgs")
+    os.makedirs(img_dir, exist_ok=True)
+    docx2txt.process(docx_path, img_dir)
+
+    candidates = []
+    for fn in os.listdir(img_dir):
+        if fn.lower().endswith((".png", ".jpg", ".jpeg")):
+            full = os.path.join(img_dir, fn)
+            img = cv2.imread(full, cv2.IMREAD_GRAYSCALE)
+            if img is not None:
+                candidates.append((full, img.shape[0]*img.shape[1], img))
+
+    shutil.rmtree(tmp_dir)
+
+    if not candidates:
+        raise ValueError("No images found in DOCX")
+
+    # pick largest by area
+    _, _, best_img = max(candidates, key=lambda x: x[1])
+
+    _, mask = cv2.threshold(
+        best_img, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
     )
-    
-    # Map to percentage scale
-    return float(round(max(0, min(100, score * 100)), 2))  # Clamped 0-100
+    return mask
 
-# REST endpoint remains unchanged
-@app.post(
-    "/verify-signature",
-    response_class=JSONResponse,
-    summary="Verify two signature images",
-    response_description="Returns JSON: { match_accuracy: float }"
-)
+# -------------------------------------------------------------------
+# 2) Preprocess & Resize
+# -------------------------------------------------------------------
+
+def preprocess_signature(mask: np.ndarray) -> np.ndarray:
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3,3))
+    clean = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    resized = cv2.resize(clean, TARGET_SIZE, interpolation=cv2.INTER_AREA)
+    return resized
+
+# -------------------------------------------------------------------
+# 3) Compute SSIM Match Accuracy
+# -------------------------------------------------------------------
+
+def compute_match_accuracy(sig1: np.ndarray, sig2: np.ndarray) -> float:
+    score, _ = ssim(sig1, sig2, full=True)
+    return float(round(score * 100, 2))
+
+# -------------------------------------------------------------------
+# 4) FastAPI Endpoint
+# -------------------------------------------------------------------
+
+@app.post("/verify-signature", response_class=JSONResponse)
 async def verify_signature(
-    real_signature: UploadFile = File(..., description="Ground-truth signature image"),
-    document_signature: UploadFile = File(..., description="Signature image from document")
-) -> JSONResponse:
-    real_bytes = await real_signature.read()
-    doc_bytes  = await document_signature.read()
+    doc1: UploadFile = File(..., description="First document (PDF or DOCX)"),
+    doc2: UploadFile = File(..., description="Second document (PDF or DOCX)")
+):
+    b1, b2 = await doc1.read(), await doc2.read()
 
     try:
-        accuracy = compute_signature_match_accuracy(real_bytes, doc_bytes)
+        # 4.1) Extract
+        if doc1.filename.lower().endswith(".pdf"):
+            sig1 = extract_signature_from_pdf(b1)
+        elif doc1.filename.lower().endswith(".docx"):
+            sig1 = extract_signature_from_docx(b1)
+        else:
+            raise HTTPException(400, f"Unsupported type for doc1: {doc1.filename}")
+
+        if doc2.filename.lower().endswith(".pdf"):
+            sig2 = extract_signature_from_pdf(b2)
+        elif doc2.filename.lower().endswith(".docx"):
+            sig2 = extract_signature_from_docx(b2)
+        else:
+            raise HTTPException(400, f"Unsupported type for doc2: {doc2.filename}")
+
+        # 4.2) Preprocess & match
+        m1 = preprocess_signature(sig1)
+        m2 = preprocess_signature(sig2)
+        accuracy = compute_match_accuracy(m1, m2)
+
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    return JSONResponse(content={ "match_accuracy": accuracy })
+    return JSONResponse({"match_accuracy": accuracy})
 
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+
+
+
+
