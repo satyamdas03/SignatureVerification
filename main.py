@@ -77,7 +77,12 @@
 
 
 
-## pdf as input
+
+
+
+
+
+##BETTER_MATCHING_ALGO (working well for similar looking signatures)
 import os, io, tempfile, shutil
 import numpy as np
 import cv2
@@ -85,24 +90,19 @@ import fitz  # PyMuPDF
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import JSONResponse
 import docx2txt
+from skimage.feature import hog, local_binary_pattern
 from skimage.metrics import structural_similarity as ssim
+from scipy.spatial.distance import cosine
 
 app = FastAPI(version="3.1.0")
 
-# Fixed size for SSIM comparison
-TARGET_SIZE = (300, 150)
-
 # -------------------------------------------------------------------
-# 1) Document → Signature Extraction
+# 1) Document → Signature Extraction (Unchanged)
 # -------------------------------------------------------------------
 
 def extract_signature_from_pdf(pdf_bytes: bytes) -> np.ndarray:
-    """
-    Extract embedded images from the last PDF page, threshold each,
-    and pick the one with the highest white-pixel ratio (the signature).
-    """
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    page = doc[-1]  # last page
+    page = doc[-1]
     images = page.get_images(full=True)
     if not images:
         doc.close()
@@ -114,7 +114,6 @@ def extract_signature_from_pdf(pdf_bytes: bytes) -> np.ndarray:
     for img_meta in images:
         xref = img_meta[0]
         pix = fitz.Pixmap(doc, xref)
-        # If CMYK, convert to RGB
         if pix.n > 4:
             pix = fitz.Pixmap(pix, 0)
         arr = np.frombuffer(pix.samples, np.uint8)
@@ -122,18 +121,15 @@ def extract_signature_from_pdf(pdf_bytes: bytes) -> np.ndarray:
         arr = arr.reshape((pix.height, pix.width, channels))
         pix = None
 
-        # Convert to gray if needed
         if channels >= 3:
             gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
         else:
             gray = arr
 
-        # Threshold (invert: strokes→white)
         _, mask = cv2.threshold(
             gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
         )
 
-        # Compute stroke density
         ratio = cv2.countNonZero(mask) / (mask.size)
         if ratio > best_ratio:
             best_ratio = ratio
@@ -145,12 +141,7 @@ def extract_signature_from_pdf(pdf_bytes: bytes) -> np.ndarray:
 
     return best_mask
 
-
 def extract_signature_from_docx(docx_bytes: bytes) -> np.ndarray:
-    """
-    Extract all images from a DOCX, pick the largest by pixel area,
-    and threshold to obtain a signature mask.
-    """
     tmp_dir = tempfile.mkdtemp()
     docx_path = os.path.join(tmp_dir, "input.docx")
     with open(docx_path, "wb") as f:
@@ -173,7 +164,6 @@ def extract_signature_from_docx(docx_bytes: bytes) -> np.ndarray:
     if not candidates:
         raise ValueError("No images found in DOCX")
 
-    # pick largest by area
     _, _, best_img = max(candidates, key=lambda x: x[1])
 
     _, mask = cv2.threshold(
@@ -182,25 +172,82 @@ def extract_signature_from_docx(docx_bytes: bytes) -> np.ndarray:
     return mask
 
 # -------------------------------------------------------------------
-# 2) Preprocess & Resize
+# 2) Enhanced Preprocessing & Comparison
 # -------------------------------------------------------------------
 
-def preprocess_signature(mask: np.ndarray) -> np.ndarray:
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3,3))
-    clean = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-    resized = cv2.resize(clean, TARGET_SIZE, interpolation=cv2.INTER_AREA)
-    return resized
+def standardize_signature(image: np.ndarray, target_size: tuple = (500, 500)) -> np.ndarray:
+    """Resize signature while maintaining aspect ratio with padding"""
+    if image is None:
+        return None
+        
+    h, w = image.shape
+    ratio = min(target_size[0] / h, target_size[1] / w)
+    new_h, new_w = int(h * ratio), int(w * ratio)
+    
+    # Preserve binary nature with nearest-neighbor interpolation
+    resized = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
+    
+    # Pad to target size with background (black)
+    top = (target_size[0] - new_h) // 2
+    bottom = target_size[0] - new_h - top
+    left = (target_size[1] - new_w) // 2
+    right = target_size[1] - new_w - left
+    padded = cv2.copyMakeBorder(resized, top, bottom, left, right, 
+                               cv2.BORDER_CONSTANT, value=0)
+    return padded
 
-# -------------------------------------------------------------------
-# 3) Compute SSIM Match Accuracy
-# -------------------------------------------------------------------
+def clean_signature(mask: np.ndarray) -> np.ndarray:
+    """Morphological cleaning without resizing"""
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    return cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
 
 def compute_match_accuracy(sig1: np.ndarray, sig2: np.ndarray) -> float:
-    score, _ = ssim(sig1, sig2, full=True)
-    return float(round(score * 100, 2))
+    """Advanced signature matching using HOG, LBP, and SSIM features"""
+    # Standardize both signatures to 500x500
+    std1 = standardize_signature(sig1, (500, 500))
+    std2 = standardize_signature(sig2, (500, 500))
+    
+    # Convert to uint8 (0-255) if needed
+    std1 = std1.astype(np.uint8)
+    std2 = std2.astype(np.uint8)
+    
+    # HOG Feature Similarity
+    fd1, _ = hog(std1, orientations=8, pixels_per_cell=(16, 16),
+                 cells_per_block=(1, 1), visualize=True, channel_axis=None)
+    fd2, _ = hog(std2, orientations=8, pixels_per_cell=(16, 16),
+                 cells_per_block=(1, 1), visualize=True, channel_axis=None)
+    
+    hog_sim = 1 - cosine(fd1, fd2) if (np.linalg.norm(fd1) > 0 and np.linalg.norm(fd2) > 0) else 0.0
+    hog_sim = max(0.0, min(1.0, hog_sim))
+    
+    # LBP Feature Similarity
+    radius = 3
+    n_points = 8 * radius
+    lbp1 = local_binary_pattern(std1, n_points, radius, method='uniform')
+    lbp2 = local_binary_pattern(std2, n_points, radius, method='uniform')
+    
+    n_bins = int(lbp1.max() + 1)
+    hist1, _ = np.histogram(lbp1.ravel(), bins=n_bins, range=(0, n_bins), density=True)
+    hist2, _ = np.histogram(lbp2.ravel(), bins=n_bins, range=(0, n_bins), density=True)
+    
+    lbp_sim = np.sum(np.sqrt(hist1 * hist2))
+    lbp_sim = max(0.0, min(1.0, lbp_sim))
+    
+    # SSIM Structural Similarity
+    ssim_score = ssim(std1, std2, data_range=255)
+    ssim_score = max(0.0, min(1.0, ssim_score))
+    
+    # Weighted combination (adjust weights as needed)
+    weights = {'hog': 0.4, 'lbp': 0.4, 'ssim': 0.2}
+    combined_score = (weights['hog'] * hog_sim +
+                     weights['lbp'] * lbp_sim +
+                     weights['ssim'] * ssim_score)
+    
+    # Convert to percentage
+    return max(0.0, min(100.0, combined_score * 100))
 
 # -------------------------------------------------------------------
-# 4) FastAPI Endpoint
+# 3) FastAPI Endpoint (Modified)
 # -------------------------------------------------------------------
 
 @app.post("/verify-signature", response_class=JSONResponse)
@@ -211,7 +258,7 @@ async def verify_signature(
     b1, b2 = await doc1.read(), await doc2.read()
 
     try:
-        # 4.1) Extract
+        # Extract signatures
         if doc1.filename.lower().endswith(".pdf"):
             sig1 = extract_signature_from_pdf(b1)
         elif doc1.filename.lower().endswith(".docx"):
@@ -226,15 +273,17 @@ async def verify_signature(
         else:
             raise HTTPException(400, f"Unsupported type for doc2: {doc2.filename}")
 
-        # 4.2) Preprocess & match
-        m1 = preprocess_signature(sig1)
-        m2 = preprocess_signature(sig2)
-        accuracy = compute_match_accuracy(m1, m2)
+        # Clean signatures (morphological operations)
+        cleaned_sig1 = clean_signature(sig1)
+        cleaned_sig2 = clean_signature(sig2)
+        
+        # Calculate match accuracy with advanced method
+        accuracy = compute_match_accuracy(cleaned_sig1, cleaned_sig2)
 
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    return JSONResponse({"match_accuracy": accuracy})
+    return JSONResponse({"match_accuracy": round(accuracy, 2)})
 
 if __name__ == "__main__":
     import uvicorn
